@@ -1,0 +1,6 @@
+{
+  "name": "suiii-playground",
+  "private": true,
+  "type": "module",
+  "description": "Suiii Playground: a GroqCloud AI playground with a live activity panel."
+}
