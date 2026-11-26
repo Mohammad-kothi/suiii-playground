@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Suiii Playground local server.
 
-Serves index.html on http://localhost:8787 and talks to GroqCloud with the
-API key from .env (or the GROQ_API_KEY environment variable), so the key
-never reaches the browser. Also runs web searches and reads pages for the
-Web search tool. Standard library only: run it with `python3 server.py`.
+Serves index.html on http://localhost:8787 and gets replies from Claude Code
+(the `claude` CLI, signed in to your Anthropic account) with all of its tools
+turned off. Also runs web searches and reads pages for the Web search tool.
+Standard library only: run it with `python3 server.py`.
 """
 import base64
 import errno
+import glob
 import html
 import ipaddress
 import json
 import os
+import queue
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,42 +29,105 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("PORT", "8787"))
-# GROQ_BASE_URL is only for testing against a stand-in API; real use leaves it unset.
-GROQ = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
-NON_CHAT = re.compile(r"whisper|orpheus|tts|guard|safeguard|playai|distil", re.I)
-PREFERRED = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+
+# ---------------------------------------------------------------------------
+# Claude Code
+# Replies come from the Claude Code CLI on this Mac, signed in to your own
+# Anthropic account. Each request runs `claude -p` with every tool, MCP
+# server, hook, plugin and slash command turned off, in an empty folder, so it
+# acts as a plain chat model and can't read or change anything on this Mac.
+# ---------------------------------------------------------------------------
+MODELS = [
+    {"id": "claude-opus-5-5", "owner": "Anthropic", "ctx": 1_000_000, "maxOut": 128_000},
+    {"id": "claude-sonnet-5-5", "owner": "Anthropic", "ctx": 1_000_000, "maxOut": 128_000},
+    {"id": "claude-haiku-5-5", "owner": "Anthropic", "ctx": 1_000_000, "maxOut": 128_000},
+    {"id": "claude-fable-5-2", "owner": "Anthropic", "ctx": 1_000_000, "maxOut": 128_000},
+]
+MODEL_IDS = {m["id"] for m in MODELS}
+EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+DEFAULT_SYSTEM = "You are Claude, a helpful AI assistant made by Anthropic, answering in a chat playground."
+DESKTOP_CLI = os.path.expanduser("~/Library/Application Support/Claude/claude-code/*/*/claude.app/Contents/MacOS/claude")
+WORKDIR = tempfile.mkdtemp(prefix="suiii-claude-")  # empty folder: nothing for Claude Code to read
 
 
-EXAMPLE_KEYS = {"your-key-here", "gsk_paste_your_real_key_here"}
-NO_KEY = "No GROQ_API_KEY found. Add it to .env next to server.py."
-EXAMPLE_KEY = "The GROQ_API_KEY in .env is still the example text. Paste your real key from console.groq.com/keys."
+def _version_key(path):
+    m = re.search(r"claude-code/([\d.]+)/", path)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
 
 
-def load_key():
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    path = os.path.join(HERE, ".env")
-    if not key and os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip().startswith("GROQ_API_KEY="):
-                    key = line.split("=", 1)[1].strip().strip("\"'")
-    return key
+def find_claude():
+    """The Claude Code CLI: $CLAUDE_BIN, then `claude` on PATH, then the copy inside the Claude desktop app."""
+    p = os.environ.get("CLAUDE_BIN", "").strip()
+    if p and os.access(p, os.X_OK):
+        return p
+    p = shutil.which("claude")
+    if p:
+        return p
+    for c in ("~/.local/bin/claude", "~/.claude/local/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
+        c = os.path.expanduser(c)
+        if os.access(c, os.X_OK):
+            return c
+    found = sorted(glob.glob(DESKTOP_CLI), key=_version_key)
+    return found[-1] if found else None
 
 
-def key_problem(key):
-    if not key:
-        return NO_KEY
-    if key in EXAMPLE_KEYS:
-        return EXAMPLE_KEY
-    return ""
+def login_command(cli):
+    return "claude auth login" if shutil.which("claude") == cli else '"%s" auth login' % cli
 
 
-def groq_err(e):
-    try:
-        return json.loads(e.read().decode("utf-8", "replace"))["error"]["message"]
-    except Exception:
-        return "HTTP %s from Groq" % getattr(e, "code", "?")
+def child_env(extra=None):
+    env = dict(os.environ)
+    if env.get("CLAUDECODE"):
+        # Started from inside a Claude Code session: don't pass that session's private
+        # settings on, so the CLI uses your own sign-in like it does from Terminal.
+        for k in list(env):
+            if k.startswith("CLAUDE") or k == "ANTHROPIC_BASE_URL":
+                del env[k]
+    env.update(extra or {})
+    return env
+
+
+def auth_status(cli):
+    r = subprocess.run([cli, "auth", "status"], capture_output=True, text=True, timeout=30, cwd=WORKDIR,
+                       env=child_env(), stdin=subprocess.DEVNULL)
+    m = re.search(r"\{.*\}", r.stdout, re.S)
+    return json.loads(m.group(0)) if m else {}
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(p.get("text", "") for p in content or [] if isinstance(p, dict) and p.get("type") == "text")
+
+
+def image_blocks(content):
+    out = []
+    for p in content if isinstance(content, list) else []:
+        url = (p.get("image_url") or {}).get("url", "") if isinstance(p, dict) and p.get("type") == "image_url" else ""
+        m = re.match(r"data:(image/(?:png|jpeg|gif|webp));base64,(.+)", url, re.S)
+        if m:
+            out.append({"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}})
+    return out
+
+
+def to_prompt(messages):
+    """OpenAI-style messages from the page -> (system prompt, user message content blocks)."""
+    system = "\n\n".join(text_of(m.get("content")) for m in messages if m.get("role") == "system").strip()
+    turns = [m for m in messages if m.get("role") in ("user", "assistant", "tool")]
+    last = turns.pop() if turns and turns[-1].get("role") == "user" else {"role": "user", "content": ""}
+    latest = text_of(last.get("content"))
+    if turns:
+        hist = []
+        for m in turns:
+            tag = {"user": "user", "assistant": "assistant", "tool": "tool_result"}[m["role"]]
+            hist.append("<%s>\n%s\n</%s>" % (tag, text_of(m.get("content")).strip(), tag))
+        prompt = ("<conversation_so_far>\n%s\n</conversation_so_far>\n\n"
+                  "Continue this conversation: write your reply to the user's latest message below. "
+                  "Reply directly, without repeating the earlier turns or these tags.\n\n%s") % ("\n".join(hist), latest)
+    else:
+        prompt = latest
+    return system or DEFAULT_SYSTEM, image_blocks(last.get("content")) + [{"type": "text", "text": prompt or "(empty message)"}]
 
 
 def fetch(url, timeout=12, limit=2_000_000):
@@ -157,6 +227,132 @@ def page_text(page):
     return (clean(title_m.group(1)) if title_m else ""), text
 
 
+class ClaudeRun:
+    """Streams one Claude Code reply to the page as OpenAI-style server-sent events."""
+
+    def __init__(self, h, proc, content):
+        self.h, self.proc = h, proc
+        self.lines = queue.Queue()
+        self.err = []
+        self.started = False
+        self.text = ""
+        self.t_first = 0.0
+        self.stop = None
+        msg = {"type": "user", "message": {"role": "user", "content": content}}
+        threading.Thread(target=self._feed, args=(json.dumps(msg) + "\n",), daemon=True).start()
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_err, daemon=True).start()
+
+    def _feed(self, line):
+        try:
+            self.proc.stdin.write(line.encode("utf-8"))
+            self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def _read(self):
+        for raw in self.proc.stdout:
+            self.lines.put(raw)
+        self.lines.put(None)
+
+    def _read_err(self):
+        for raw in self.proc.stderr:
+            if sum(map(len, self.err)) < 8000:
+                self.err.append(raw.decode("utf-8", "replace"))
+
+    def start(self):
+        if not self.started:
+            self.started = True
+            self.h.send_response(200)
+            self.h.send_header("Content-Type", "text/event-stream")
+            self.h.send_header("Cache-Control", "no-cache")
+            self.h.end_headers()
+
+    def emit(self, obj):
+        self.start()
+        self.h.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
+        self.h.wfile.flush()
+
+    def delta(self, **d):
+        if not self.t_first:
+            self.t_first = time.time()
+        self.emit({"choices": [{"index": 0, "delta": d}]})
+
+    def fail(self, msg, auth=False):
+        low = msg.lower()
+        status = 401 if auth or "not logged in" in low or "/login" in low else 429 if ("limit" in low or "rate" in low) else 502
+        if self.started:
+            self.emit({"error": {"message": msg}})
+        else:
+            self.h.send_json(status, {"error": msg, "code": "no_login" if status == 401 else "claude_error"})
+
+    def run(self):
+        auth_failed, result = False, None
+        try:
+            deadline = time.time() + 900
+            while time.time() < deadline:
+                try:
+                    raw = self.lines.get(timeout=5)
+                except queue.Empty:
+                    if self.started:  # notice a closed tab while the model is thinking quietly
+                        self.h.wfile.write(b": keep-alive\n\n")
+                        self.h.wfile.flush()
+                    continue
+                if raw is None:
+                    break
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                t = ev.get("type")
+                if t == "stream_event" and not ev.get("parent_tool_use_id"):
+                    e = ev.get("event") or {}
+                    if e.get("type") == "message_start":
+                        self.start()  # the request reached the model, so sign-in is fine
+                    elif e.get("type") == "content_block_delta":
+                        d = e.get("delta") or {}
+                        if d.get("type") == "text_delta" and d.get("text"):
+                            self.text += d["text"]
+                            self.delta(content=d["text"])
+                        elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                            self.delta(reasoning=d["thinking"])
+                    elif e.get("type") == "message_delta":
+                        self.stop = (e.get("delta") or {}).get("stop_reason") or self.stop
+                elif t == "assistant" and ev.get("error"):
+                    auth_failed = auth_failed or ev["error"] == "authentication_failed"
+                elif t == "result":
+                    result = ev
+                    break
+            else:
+                return self.fail("Claude Code took longer than 15 minutes and was stopped.")
+            if result is None:
+                tail = "".join(self.err).strip().splitlines()[-1:] or ["Claude Code stopped without a reply."]
+                return self.fail(tail[0])
+            if result.get("is_error") or result.get("subtype") != "success":
+                msg = result.get("result") or "; ".join(map(str, result.get("errors") or [])) or "Claude Code returned an error."
+                return self.fail(str(msg), auth_failed)
+            if not self.text and result.get("result"):
+                self.delta(content=result["result"])  # no partial chunks came through; send the whole reply
+            u = result.get("usage") or {}
+            gen = max(0.0, time.time() - self.t_first) if self.t_first else 0.0
+            self.emit({"choices": [{"index": 0, "delta": {}, "finish_reason": "length" if (self.stop or result.get("stop_reason")) == "max_tokens" else "stop"}],
+                       "usage": {"prompt_tokens": (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0),
+                                 "completion_tokens": u.get("output_tokens") or 0,
+                                 "completion_tokens_details": {"reasoning_tokens": ((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0)},
+                                 "completion_time": round(gen, 3)}})
+            self.h.wfile.write(b"data: [DONE]\n\n")
+            self.h.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the page stopped the reply
+        finally:
+            if self.proc.poll() is None:
+                self.proc.kill()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Suiii/1.0"
 
@@ -215,26 +411,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def models(self):
-        key = load_key()
-        if key_problem(key):
-            return self.send_json(401, {"error": key_problem(key), "code": "no_key"})
-        req = urllib.request.Request(GROQ + "/models", headers={"Authorization": "Bearer " + key, "User-Agent": "suiii-playground"})
+        cli = find_claude()
+        if not cli:
+            return self.send_json(503, {"error": "Claude Code wasn't found on this Mac. Install the Claude desktop app or the claude CLI.", "code": "no_cli"})
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = json.load(r)
-        except urllib.error.HTTPError as e:
-            return self.send_json(e.code, {"error": groq_err(e)})
+            st = auth_status(cli)
         except Exception as e:
-            return self.send_json(502, {"error": "Couldn't reach Groq: %s" % e})
-        models = [{"id": m["id"], "owner": m.get("owned_by"), "ctx": m.get("context_window"), "maxOut": m.get("max_completion_tokens")}
-                  for m in data.get("data", []) if m.get("active", True) and not NON_CHAT.search(m["id"])]
-        rank = lambda m: (PREFERRED.index(m["id"]) if m["id"] in PREFERRED else len(PREFERRED), -(m["ctx"] or 0), m["id"])
-        self.send_json(200, {"models": sorted(models, key=rank)})
+            return self.send_json(502, {"error": "Couldn't run Claude Code: %s" % e, "code": "cli_error"})
+        if not st.get("loggedIn"):
+            cmd = login_command(cli)
+            return self.send_json(401, {"error": "Claude Code isn't signed in. Run this once in Terminal, then reload: " + cmd,
+                                        "code": "no_login", "login": cmd})
+        self.send_json(200, {"models": MODELS, "provider": "claude-code"})
 
     def chat(self):
-        key = load_key()
-        if key_problem(key):
-            return self.send_json(401, {"error": key_problem(key), "code": "no_key"})
+        cli = find_claude()
+        if not cli:
+            return self.send_json(503, {"error": "Claude Code wasn't found on this Mac.", "code": "no_cli"})
         n = int(self.headers.get("Content-Length") or 0)
         if n > 12_000_000:
             return self.send_json(413, {"error": "Request too large"})
@@ -242,26 +435,23 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
             return self.send_json(400, {"error": "Invalid JSON"})
-        body["stream"] = True
-        req = urllib.request.Request(GROQ + "/chat/completions", data=json.dumps(body).encode("utf-8"), method="POST",
-                                     headers={"Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "suiii-playground"})
+        model = body.get("model") if body.get("model") in MODEL_IDS else MODELS[0]["id"]
+        system, content = to_prompt(body.get("messages") or [])
+        args = [cli, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--include-partial-messages", "--model", model, "--system-prompt", system,
+                "--tools", "", "--strict-mcp-config", "--safe-mode", "--disable-slash-commands", "--no-session-persistence"]
+        if body.get("reasoning_effort") in EFFORTS:
+            args += ["--effort", body["reasoning_effort"]]
+        extra = {}
+        max_out = body.get("max_completion_tokens") or body.get("max_tokens")
+        if isinstance(max_out, int) and max_out > 0:
+            extra["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(min(max_out, 128_000))
         try:
-            upstream = urllib.request.urlopen(req, timeout=300)
-        except urllib.error.HTTPError as e:
-            return self.send_json(e.code, {"error": groq_err(e)})
-        except Exception as e:
-            return self.send_json(502, {"error": "Couldn't reach Groq: %s" % e})
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        try:
-            for line in upstream:
-                self.wfile.write(line)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # the page stopped the reply
-        finally:
-            upstream.close()
+            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    cwd=WORKDIR, env=child_env(extra))
+        except OSError as e:
+            return self.send_json(502, {"error": "Couldn't start Claude Code: %s" % e, "code": "cli_error"})
+        ClaudeRun(self, proc, content).run()
 
     def search(self, q):
         q = q.strip()[:200]
@@ -304,9 +494,15 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not os.path.exists(os.path.join(HERE, "index.html")):
         sys.exit("index.html is missing next to server.py")
-    problem = key_problem(load_key())
-    if problem:
-        print("Warning: " + problem + " The server rereads .env on every request, so no restart is needed after you fix it.")
+    cli = find_claude()
+    if not cli:
+        print("Warning: Claude Code wasn't found. Install the Claude desktop app or the claude CLI, or set CLAUDE_BIN.")
+    else:
+        try:
+            if not auth_status(cli).get("loggedIn"):
+                print("Claude Code isn't signed in yet. Run this once, then reload the page:\n  " + login_command(cli))
+        except Exception as e:
+            print("Warning: couldn't run Claude Code (%s)" % e)
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     except OSError as e:
