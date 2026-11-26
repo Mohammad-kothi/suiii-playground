@@ -1492,6 +1492,7 @@ dialog[open] { animation: pop .14s ease-out; }
 .panel .ps { counter-increment: ps; }
 .panel .ps > .ps-head:first-child .label::before { content: counter(ps, decimal-leading-zero) "  "; }
 .seg { border-radius: 2px; }
+#segReason { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .seg button { border-radius: 1px; font: 600 10.5px/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
 .num, .field { border-radius: 2px; }
 .big-cost { font-family: var(--font-hud); letter-spacing: .02em; }
@@ -1900,7 +1901,7 @@ body {
       <!-- COMPARE -->
       <div class="view" id="view-compare" hidden>
         <div class="scroll-view"><div class="wrap">
-          <div class="view-title"><div><h1>Compare models</h1><p>Run one prompt on several Groq models side by side. Uses the system prompt from the current chat and the parameters from Run settings.</p></div></div>
+          <div class="view-title"><div><h1>Compare models</h1><p>Run one prompt on several Claude models side by side. Uses the system prompt from the current chat and the parameters from Run settings.</p></div></div>
           <div class="card cmp-top">
             <label class="label" for="cmpPrompt">Prompt</label>
             <textarea class="field" id="cmpPrompt" rows="3"></textarea>
@@ -1972,7 +1973,7 @@ body {
         </section>
         <section class="ps" aria-labelledby="hUsage">
           <div class="ps-head"><span class="label" id="hUsage">Estimated usage</span><span class="tok" id="priceLine"></span></div>
-          <div><div class="big-cost" id="nextCost"></div><div class="param-desc" style="margin-top:4px">Estimated input for the next request. Each reply shows the exact token counts Groq reports.</div></div>
+          <div><div class="big-cost" id="nextCost"></div><div class="param-desc" style="margin-top:4px">Estimated input for the next request. Each reply shows the exact token counts Claude Code reports.</div></div>
           <div class="stack" id="inStack" role="img" aria-label="Input token breakdown"></div>
           <div class="legend" id="inLegend"></div>
           <div class="param"><div class="param-top"><span style="font-size:12.5px;color:var(--fg-2)">Context window</span><span class="tok" id="ctxText"></span></div><div class="ctx-bar"><span id="ctxFill"></span></div></div>
@@ -2104,44 +2105,41 @@ const I = {
 /* =========================================================
    Static data
    ========================================================= */
-/* Models come from Groq's /models list through the local server. This list is the fallback. */
+/* Claude models, run through Claude Code by the local server. The server sends the same list; this copy is for demo mode. */
 const FALLBACK_MODELS = [
-  { id: 'openai/gpt-oss-120b', owner: 'OpenAI', ctx: 131072, maxOut: 65536 },
-  { id: 'openai/gpt-oss-20b', owner: 'OpenAI', ctx: 131072, maxOut: 65536 },
-  { id: 'qwen/qwen3.8-27b', owner: 'Alibaba Cloud', ctx: 131072, maxOut: 16384 },
-  { id: 'allam-2-7b', owner: 'SDAIA', ctx: 4096, maxOut: 4096 },
+  { id: 'claude-opus-5-5', owner: 'Anthropic', ctx: 1000000, maxOut: 128000 },
+  { id: 'claude-sonnet-5-5', owner: 'Anthropic', ctx: 1000000, maxOut: 128000 },
+  { id: 'claude-haiku-5-5', owner: 'Anthropic', ctx: 1000000, maxOut: 128000 },
+  { id: 'claude-fable-5-2', owner: 'Anthropic', ctx: 1000000, maxOut: 128000 },
 ];
 const BLURBS = {
-  'openai/gpt-oss-120b': 'Largest model here. Strongest reasoning, code and tool use.',
-  'openai/gpt-oss-20b': 'Smaller GPT-OSS. Very fast, still reasons and uses tools.',
-  'qwen/qwen3.8-27b': 'Reasoning model, good at code, math and many languages.',
-  'allam-2-7b': 'Small Arabic and English model. 4K context, no tools.',
+  'claude-opus-5-5': 'The current Opus and Claude Code’s default. Strong reasoning, writing and code.',
+  'claude-sonnet-5-5': 'Fast and capable for everyday questions, writing and code.',
+  'claude-haiku-5-5': 'Fastest and lightest. Good for quick, simple answers.',
+  'claude-fable-5-2': 'Anthropic’s most capable widely released model, for the hardest problems. Slower and uses more of your plan.',
 };
 function prettyName(id) {
-  const base = id.split('/').pop();
-  const oss = base.match(/^gpt-oss-(\d+)b$/i); if (oss) return `GPT-OSS ${oss[1]}B`;
-  return base.replace(/-/g, ' ').replace(/\b(\d+(?:\.\d+)?)b\b/gi, '$1B').replace(/^qwen/i, 'Qwen').replace(/^allam/i, 'ALLaM').replace(/^llama/i, 'Llama').replace(/^gemma/i, 'Gemma').replace(/^kimi/i, 'Kimi');
+  const m = id.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?$/);
+  return m ? `Claude ${m[1].charAt(0).toUpperCase() + m[1].slice(1)} ${m[2]}${m[3] ? '.' + m[3] : ''}` : id;
 }
 function decorate(m) {
   const id = m.id;
-  const thinks = /gpt-oss|qwen3|qwq|deepseek-r1|reason|muse-spark/i.test(id);
-  // Groq accepts reasoning_effort low/medium/high only on these; any other value or model gets a 400
-  const effort = /gpt-oss|qwen3\.8|muse-spark/i.test(id);
-  // gpt-oss streams its reasoning in its own field and rejects reasoning_format; other reasoning models need 'parsed'
-  const parse = thinks && !/gpt-oss/i.test(id);
-  const tools = !/allam/i.test(id);
-  const vision = /vision|llama-4|scout|maverick|llava/i.test(id);
-  return { id, name: prettyName(id), owner: m.owner || 'Groq', ctx: m.ctx || 8192, maxOut: m.maxOut || 8192, thinks, effort, parse, tools, vision,
-    blurb: BLURBS[id] || `${m.owner || 'Open'} model hosted on Groq.`, tags: [thinks && 'reasoning', tools && 'tools', vision && 'vision'].filter(Boolean) };
+  // Every current Claude model thinks adaptively and takes an effort level. Claude Code runs here
+  // with its tools off, so the page's code interpreter and custom functions aren't offered.
+  return { id, name: prettyName(id), owner: m.owner || 'Anthropic', ctx: m.ctx || 1000000, maxOut: m.maxOut || 128000,
+    thinks: true, effort: true, parse: false, tools: false, vision: true,
+    blurb: BLURBS[id] || 'Claude model, run through Claude Code.', tags: ['reasoning', 'vision'] };
 }
 let MODELS = FALLBACK_MODELS.map(decorate);
+// A tool switch only counts when the chosen model can use it (web search runs in the server, so it always can).
+const toolOn = k => !!S.settings[k] && (k === 'web' || modelById(S.settings.model).tools);
 const modelById = id => MODELS.find(m => m.id === id) || MODELS[0];
 
 const PARAMS = [
-  { k: 'temperature', label: 'Temperature', min: 0, max: 2, step: 0.01, def: 1, desc: 'Higher values give more varied replies. Lower values are more focused.', warn: v => v > 1.4 ? 'Above 1.4, replies often drift or lose coherence.' : '' },
-  { k: 'maxTokens', label: 'Max output tokens', min: 16, max: 65536, step: 16, def: 4096, int: true, desc: 'Replies stop at this length. On reasoning models, thinking counts toward it.', warn: v => v < 512 ? 'Very low. Reasoning models may run out before they answer.' : '' },
-  { k: 'topP', label: 'Top P', min: 0, max: 1, step: 0.01, def: 1, desc: 'Samples only from the most likely tokens whose probabilities add up to P.', warn: () => '' },
+  { k: 'maxTokens', label: 'Max output tokens', min: 1024, max: 128000, step: 1024, def: 32768, int: true, desc: 'Replies stop at this length. Thinking counts toward it.', warn: v => v < 4096 ? 'Low. Claude may run out while thinking, before it answers.' : '' },
 ];
+const EFFORT_LEVELS = ['auto', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORT_LABEL = { auto: 'Auto', low: 'Low', medium: 'Med', high: 'High', xhigh: 'XHigh', max: 'Max' };
 const descOf = (p, v) => typeof p.desc === 'function' ? p.desc(v) : p.desc;
 const DEFAULT_SCHEMA = `{
   "type": "object",
@@ -2155,7 +2153,7 @@ const DEFAULT_SCHEMA = `{
   },
   "required": ["name", "price"]
 }`;
-const DEFAULT_SETTINGS = { model: 'openai/gpt-oss-120b', temperature: 1, maxTokens: 4096, topP: 1, freq: 0, pres: 0, reasoning: 'auto', json: false, schema: DEFAULT_SCHEMA, web: false, code: false, vision: true, functions: true };
+const DEFAULT_SETTINGS = { model: 'claude-opus-5-5', temperature: 1, maxTokens: 32768, topP: 1, freq: 0, pres: 0, reasoning: 'auto', json: false, schema: DEFAULT_SCHEMA, web: false, code: false, vision: true, functions: true };
 
 function topicOf(p) {
   let t = String(p).trim().split('\n')[0]
@@ -2170,11 +2168,11 @@ function analyzeImage(url) {
 }
 
 /* =========================================================
-   Groq through the local server
+   Claude Code through the local server
    ========================================================= */
 const RT = { server: 'loading', error: '' };
 const API_HEADERS = { 'X-Kiln': '1' };
-// A deployed Suiii (Vercel) can require a passcode for live Groq answers; it is remembered in this browser.
+// A deployed Suiii (Vercel) can require a passcode for live answers; it is remembered in this browser.
 const PASSKEY = 'suiii-pass';
 try { const p = localStorage.getItem(PASSKEY); if (p) API_HEADERS['X-Suiii-Pass'] = p; } catch {}
 function forgetPass() { delete API_HEADERS['X-Suiii-Pass']; try { localStorage.removeItem(PASSKEY); } catch {} }
@@ -2271,7 +2269,7 @@ function demoPick(body) {
   if (/<search_results>/.test(ask)) {
     return {
       reasoning: think ? 'Search results are attached. In demo mode they are sample sources that were not fetched, so I must not claim specific version numbers from them.' : '',
-      content: '**Demo reply: these sources were not actually read.** In live mode the model reads each page and answers with citations.\n\nFor the current Node.js LTS line, the authoritative places to check are the official releases page [1] and the Release Working Group’s schedule [2]. Each new LTS promotion is announced on the Node.js blog [3].\n\nAdd a Groq API key to get a real, cited answer.',
+      content: '**Demo reply: these sources were not actually read.** In live mode the model reads each page and answers with citations.\n\nFor the current Node.js LTS line, the authoritative places to check are the official releases page [1] and the Release Working Group’s schedule [2]. Each new LTS promotion is announced on the Node.js blog [3].\n\nRun the local server with Claude Code signed in to get a real, cited answer.',
     };
   }
   if (/train/i.test(ask) && /catch/i.test(ask)) {
@@ -2283,7 +2281,7 @@ function demoPick(body) {
   const short = ask.replace(/\s+/g, ' ').trim().slice(0, 140);
   return {
     reasoning: think ? `The user asked: “${short}”. This is a demo run with no model behind it, so I’ll explain what a live run does and show the formatting the interface supports.` : '',
-    content: `**Demo mode: simulated reply.** There’s no Groq API key or local server here, so this answer was generated in your browser to show the interface working.\n\n> ${short || '(empty prompt)'}\n\nWith the server running, \`server.py\` sends your prompt to **${name}** on GroqCloud and streams the real reply into this space, while the neural core above shows each stage:\n\n1. **Ignition**: the prompt flows into the input layer.\n2. **Thinking**: reasoning tokens fire through the network and the core.\n3. **Output**: the reply streams out through the louvres.\n\nTry the four starters: they show web search with sources, code running on a CSV, a function call, and step-by-step reasoning.`,
+    content: `**Demo mode: simulated reply.** There’s no local server with Claude Code here, so this answer was generated in your browser to show the interface working.\n\n> ${short || '(empty prompt)'}\n\nWith the server running, \`server.py\` sends your prompt to **${name}** through Claude Code and streams the real reply into this space, while the neural core above shows each stage:\n\n1. **Ignition**: the prompt flows into the input layer.\n2. **Thinking**: reasoning tokens fire through the network and the core.\n3. **Output**: the reply streams out through the louvres.\n\nTry the four starters: they show web search with sources, code running on a CSV, a function call, and step-by-step reasoning.`,
   };
 }
 function demoChat(body, signal) {
@@ -2307,7 +2305,7 @@ function demoChat(body, signal) {
         }
         const inChars = (body.messages || []).reduce((a, m) => a + demoText(m).length, 0);
         const outR = (plan.reasoning || '').length, outC = (plan.content || JSON.stringify(plan.tool || '')).length;
-        send({ choices: [], x_groq: { usage: { prompt_tokens: Math.ceil(inChars / 4), completion_tokens: Math.ceil((outR + outC) / 4), completion_tokens_details: { reasoning_tokens: Math.ceil(outR / 4) }, completion_time: (performance.now() - t0 - 650) / 1000 } } });
+        send({ choices: [], usage: { prompt_tokens: Math.ceil(inChars / 4), completion_tokens: Math.ceil((outR + outC) / 4), completion_tokens_details: { reasoning_tokens: Math.ceil(outR / 4) }, completion_time: (performance.now() - t0 - 650) / 1000 } });
         ctl.enqueue(enc.encode('data: [DONE]\n\n')); ctl.close();
       } catch (e) { ctl.error(e); }
     },
@@ -2322,7 +2320,7 @@ async function initRuntime() {
     const j = await r.json().catch(() => ({}));
     if (r.ok) { const list = (j.models || []).map(decorate); if (list.length) MODELS = list; RT.server = 'ok'; }
     else if (/^passcode/.test(j.code || '')) { RT.server = 'locked'; RT.error = j.error; if (j.code === 'passcode_wrong') forgetPass(); }
-    else { RT.server = r.status === 401 ? 'nokey' : 'error'; RT.error = j.error || r.statusText; }
+    else { RT.server = r.status === 401 ? 'nokey' : 'error'; RT.error = j.error || r.statusText; RT.login = j.login || ''; }
   } catch { RT.server = 'down'; }
   const locked = RT.server === 'locked';
   if (forced || RT.server !== 'ok') { RT.why = forced ? 'forced' : RT.server; RT.server = 'demo'; DEMO.on = true; }
@@ -2337,7 +2335,7 @@ async function initRuntime() {
 function askPasscode() {
   openDialog({
     title: 'Enter the passcode',
-    body: `<p>This Suiii site gives live Groq answers to people with the passcode. Without it you can still explore everything in demo mode.</p>
+    body: `<p>This Suiii site gives live answers to people with the passcode. Without it you can still explore everything in demo mode.</p>
       <div class="form-row"><label for="passIn">Passcode</label><input class="field" id="passIn" type="password" autocomplete="current-password"></div>
       <div class="form-err" id="passErr" role="alert"></div>`,
     actions: [{ label: 'Use demo mode' }, { label: 'Unlock', primary: true, fn: d => { unlock($('#passIn', d).value.trim(), d); return false; } }],
@@ -2360,33 +2358,37 @@ async function unlock(pass, d) {
   API_HEADERS['X-Suiii-Pass'] = pass; try { localStorage.setItem(PASSKEY, pass); } catch {}
   dlg.close();
   await initRuntime();
-  toast(RT.server === 'ok' ? 'Unlocked. Replies now come from Groq.' : 'Passcode accepted, but Groq isn’t reachable yet. See the line under the message box.');
+  toast(RT.server === 'ok' ? 'Unlocked. Replies are live now.' : 'Passcode accepted, but the model isn’t reachable yet. See the line under the message box.');
 }
 function paintStatus() {
   const p = $('#syncPill');
   const map = {
     loading: ['', 'Connecting…', 'Connecting to the local server'],
-    ok: ['good', 'Groq connected', 'The local server is running and Groq accepted your API key'],
-    nokey: ['bad', 'API key missing', 'Add GROQ_API_KEY to the .env file next to server.py, then restart the server'],
-    error: ['warn', 'Groq error', RT.error || 'Groq returned an error'],
+    ok: ['good', 'Claude Code connected', 'Replies come from Claude Code on this Mac, signed in to your Anthropic account'],
+    nokey: ['bad', 'Not signed in', RT.error || 'Claude Code isn’t signed in'],
+    error: ['warn', 'Claude Code error', RT.error || 'Claude Code returned an error'],
     down: ['bad', 'Server offline', 'Start the local server with: python3 server.py'],
-    demo: ['demo', 'Demo mode', 'No API key or local server found, so replies are simulated in the browser'],
+    demo: ['demo', 'Demo mode', RT.why === 'nokey' ? 'Claude Code isn’t signed in, so replies are simulated in the browser' : 'No local server with Claude Code found, so replies are simulated in the browser'],
   };
   const lockedDemo = RT.server === 'demo' && RT.why === 'locked';
-  const [cls, label, title] = lockedDemo ? ['demo', 'Demo · locked', 'Enter the passcode for live Groq answers'] : map[RT.server] || map.loading;
+  const signedOut = RT.server === 'demo' && RT.why === 'nokey';
+  const [cls, label, title] = lockedDemo ? ['demo', 'Demo · locked', 'Enter the passcode for live answers']
+    : signedOut ? ['bad', 'Not signed in', RT.error || 'Claude Code isn’t signed in'] : map[RT.server] || map.loading;
   if (p) { p.className = 'pill demo-pill ' + cls; p.textContent = label; p.title = title; }
   const h = $('#aiHint');
   if (h) {
     h.textContent = RT.server === 'down' ? 'Can’t reach the local server. Start it with python3 server.py, then reload.'
-      : RT.server === 'nokey' ? 'No API key found. Add GROQ_API_KEY to .env next to server.py, then restart it.'
-      : RT.server === 'error' ? 'Groq error: ' + RT.error
+      : RT.server === 'nokey' ? (RT.error || 'Claude Code isn’t signed in.')
+      : RT.server === 'error' ? 'Claude Code error: ' + RT.error
       : RT.server === 'loading' ? 'Connecting to the local server…'
       : RT.server === 'demo' ? ''
-      : API_HEADERS['X-Suiii-Pass'] ? 'Replies come from GroqCloud. The API key stays on the server.'
-      : 'Replies come from GroqCloud. Your API key stays in the local server.';
+      : API_HEADERS['X-Suiii-Pass'] ? 'Replies are live. The key stays on the server.'
+      : 'Replies come from Claude Code on this Mac, with its tools turned off.';
     if (RT.server === 'demo') h.innerHTML = lockedDemo
-      ? '<span class="hint-demo"><b>Demo mode.</b> This site needs a passcode for live Groq answers. <button type="button" class="hint-link" data-unlock>Enter passcode</button></span>'
-      : '<span class="hint-demo"><b>Demo mode.</b> Replies are simulated in your browser because no API key or server was found. Add GROQ_API_KEY to .env and run python3 server.py for real answers.</span>';
+      ? '<span class="hint-demo"><b>Demo mode.</b> This site needs a passcode for live answers. <button type="button" class="hint-link" data-unlock>Enter passcode</button></span>'
+      : RT.why === 'nokey'
+        ? `<span class="hint-demo"><b>Claude Code isn’t signed in.</b> Replies are simulated until you run <code class="mono">${esc(RT.login || 'claude auth login')}</code> once in Terminal, then reload.</span>`
+        : '<span class="hint-demo"><b>Demo mode.</b> Replies are simulated in your browser because the local server isn’t running. Run python3 server.py for real answers from Claude Code.</span>';
     const bad = ['down', 'nokey', 'error'].includes(RT.server);
     h.className = bad ? 'hint-err' : '';
     if (bad) h.setAttribute('role', 'alert'); else h.removeAttribute('role');
@@ -2397,10 +2399,10 @@ function errText(e) {
   if (!e) return 'Something went wrong.';
   if (e.code === 'down') return 'Can’t reach the local server. Start it with python3 server.py, then try again.';
   if (e.code === 'http') {
-    if (e.status === 401) return 'Groq rejected the API key. Put a valid key in .env and restart the server.';
-    if (e.status === 429) return 'Groq rate limit reached. Wait a moment, then regenerate. (' + (e.message || 'HTTP 429') + ')';
+    if (e.status === 401) return e.message || 'Claude Code isn’t signed in. Run claude auth login, then reload.';
+    if (e.status === 429) return 'You’ve hit a Claude usage limit. Wait, then regenerate. (' + (e.message || 'HTTP 429') + ')';
     if (e.status === 413) return 'This request is too large for the model. Start a new chat or remove attachments.';
-    return 'Groq returned an error: ' + (e.message || 'HTTP ' + e.status);
+    return 'Claude Code returned an error: ' + (e.message || 'HTTP ' + e.status);
   }
   if (e.code === 'invalid_json') return 'The reply wasn’t valid JSON. Regenerate, or simplify the schema.';
   return 'Something went wrong: ' + (e.message || e.code || 'unknown error');
@@ -2417,7 +2419,7 @@ function userTurn(m) { const files = (m.files || []).map(fileBlock).join('\n\n')
 function systemMessage(system, extra = []) {
   const parts = [];
   if (system && system.trim()) parts.push(system.trim());
-  parts.push('Format replies in GitHub-flavored Markdown: headings, lists, tables and fenced code blocks with a language tag all render.');
+  parts.push('Format replies in GitHub-flavored Markdown: headings, lists, tables and fenced code blocks with a language tag all render. LaTeX does not render here, so write math in plain text (for example 42 ÷ 21 = 2), not with $ or $$.');
   return parts.concat(extra).join('\n\n');
 }
 const msgText = x => typeof x.content === 'string' ? x.content : (x.content.find(p => p.type === 'text') || { text: '' }).text;
@@ -2443,21 +2445,20 @@ function appendToLastUser(messages, text) {
 }
 function requestParams(model) {
   const s = S.settings;
-  const p = { max_completion_tokens: Math.min(s.maxTokens, model.maxOut), temperature: s.temperature, top_p: s.topP };
-  if (model.effort && s.reasoning !== 'auto') p.reasoning_effort = s.reasoning;
-  if (model.parse) p.reasoning_format = 'parsed';
+  const p = { max_completion_tokens: clamp(s.maxTokens, 1024, model.maxOut) };
+  if (s.reasoning !== 'auto') p.reasoning_effort = s.reasoning;
   return p;
 }
 
 /* streaming client */
-// Optional fields Groq may refuse for a model or mode. A 400 that names one retries once without it.
+// Optional fields a model may refuse. A 400 that names one retries once without it.
 const OPTIONAL_FIELDS = [['response_format', /json|response_format/i], ['stream_options', /stream_options|include_usage/i], ['reasoning_format', /reasoning_format/i], ['reasoning_effort', /reasoning_effort/i]];
 // Some reasoning models put their thinking inline as <think>…</think>; keep it out of the answer.
 function splitThink(raw) {
   const m = raw.match(/^\s*<think>([\s\S]*?)(?:<\/think>\s*|$)/);
   return m ? { reasoning: m[1].trim(), content: raw.slice(m[0].length) } : { reasoning: '', content: raw };
 }
-async function groqStream(body, { signal, onDelta } = {}) {
+async function chatStream(body, { signal, onDelta } = {}) {
   let res, req = { ...body, stream: true, stream_options: { include_usage: true } };
   for (let tries = 0; ; tries++) {
     try { res = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', ...API_HEADERS }, body: JSON.stringify(req), signal }); }
@@ -2488,7 +2489,7 @@ async function groqStream(body, { signal, onDelta } = {}) {
       });
       if (ch.finish_reason) out.finish = ch.finish_reason;
     }
-    const u = j.usage || (j.x_groq && j.x_groq.usage); if (u) out.usage = u;
+    const u = j.usage; if (u) out.usage = u;
     onDelta && onDelta(out);
   };
   try {
@@ -2524,7 +2525,7 @@ async function runChatInner({ model, messages, tools = [], params, signal, onUpd
     const cPre = content ? content + '\n\n' : '', rPre = reasoning ? reasoning + '\n\n' : '';
     let r;
     for (let tries = 0; ; tries++) {
-      try { r = await groqStream(body, { signal, onDelta: o => onUpdate && onUpdate({ content: cPre + o.content, reasoning: rPre + o.reasoning }) }); break; }
+      try { r = await chatStream(body, { signal, onDelta: o => onUpdate && onUpdate({ content: cPre + o.content, reasoning: rPre + o.reasoning }) }); break; }
       catch (e) {
         const wait = e && e.code === 'http' && e.status === 429 && tries === 0 && !e.text ? retryAfter(e.message) : 0;
         if (!wait || wait > 30) throw e;
@@ -2562,12 +2563,11 @@ async function fetchJSON(url, signal) {
 }
 async function planQueries(history, prompt, signal) {
   const ctx = history.slice(-4).map(m => (m.role === 'user' ? 'User: ' + m.content : 'Assistant: ' + m.v[m.vi].content).slice(0, 700)).join('\n');
-  const fast = MODELS.find(m => /gpt-oss-20b/.test(m.id)) || modelById(S.settings.model);
+  const fast = MODELS.find(m => /haiku/.test(m.id)) || modelById(S.settings.model);
   try {
     const body = { model: fast.id, max_completion_tokens: 800, response_format: { type: 'json_object' }, messages: [{ role: 'user', content: `Write web search queries that would find current, reliable information for answering the user's latest message. Reply with only a JSON object like {"queries": ["first query", "second query"]} holding 1 or 2 short queries (at most 8 words each), most useful first.\n\nConversation:\n${ctx}` }] };
-    if (fast.effort) body.reasoning_effort = 'low';
-    if (fast.parse) body.reasoning_format = 'parsed';
-    const r = await groqStream(body, { signal });
+    body.reasoning_effort = 'low';
+    const r = await chatStream(body, { signal });
     const j = JSON.parse(r.content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
     const qs = (Array.isArray(j) ? j : j.queries || []).map(q => String(q).trim()).filter(Boolean).slice(0, 2);
     if (qs.length) return qs;
@@ -2695,7 +2695,7 @@ function checkSchema(v) {
 /* =========================================================
    State
    ========================================================= */
-const SKEY = 'kiln-groq-v1';
+const SKEY = 'kiln-groq-v1';   // name kept from the Groq version so saved chats carry over
 let S;
 const pending = { files: [] };
 let busy = false, ctrl = null, streamingId = null, stick = true;
@@ -2951,7 +2951,7 @@ $('#railTpl').addEventListener('click', e => { const b = e.target.closest('[data
    ========================================================= */
 function renderModelBtn() {
   const m = modelById(S.settings.model);
-  $('#modelBtn').innerHTML = `<span class="model-dot"></span>${esc(m.name)}<small>${esc(m.owner)} · Groq</small>${I.chevD}`;
+  $('#modelBtn').innerHTML = `<span class="model-dot"></span>${esc(m.name)}<small>Claude Code</small>${I.chevD}`;
   $('#userPrompt').placeholder = `Message ${m.name}. Drop files here or press / to focus.`;
   $('#modelMenu').innerHTML = MODELS.map(x => `<button class="model-opt" role="option" aria-selected="${x.id === m.id}" data-mid="${x.id}">
     <b>${esc(x.name)} ${x.id === m.id ? `<span style="color:var(--accent)">${I.check}</span>` : ''}</b>
@@ -3058,8 +3058,8 @@ function assistantHTML(m) {
 }
 const SUGGESTIONS = [
   { icon: 'globe', title: 'What’s new in Node.js?', text: 'Searches the web and cites sources', run: () => { setTool('web', true); fillComposer('What is the current Node.js LTS release, and what changed in it?'); } },
-  { icon: 'code', title: 'Analyze a CSV', text: 'The model writes and runs code on sample data', run: async () => { setTool('code', true); await addFiles([sampleCSV()]); fillComposer('Analyze this sales data. Which month and region stand out, and why?'); } },
-  { icon: 'fn', title: 'What’s the weather in Lisbon?', text: 'The model calls your get_weather function', run: () => { setTool('functions', true); fillComposer('What’s the weather in Lisbon right now?'); } },
+  { icon: 'file', title: 'Analyze a CSV', text: 'Claude reads attached sample sales data', run: async () => { await addFiles([sampleCSV()]); fillComposer('Analyze this sales data. Which month and region stand out, and why?'); } },
+  { icon: 'code', title: 'Extract product data', text: 'Turns on JSON mode and fills a schema', run: () => { if (!S.settings.json) { S.settings.json = true; save(); renderPanel(); } fillComposer('Pull the product details out of this listing: “Aurora desk lamp (SKU AL-220), warm LED, $49.99, in stock, tags: lighting, office.”'); } },
   { icon: 'brain', title: 'Think it through', text: 'Shows the model’s reasoning as it works', run: () => { fillComposer('A train leaves at 3:40 pm at 84 km/h. A second train leaves the same station on the same track at 4:10 pm at 105 km/h. When and how far from the station does the second train catch up?'); } },
 ];
 const seenMsgs = new Set();
@@ -3072,7 +3072,7 @@ function renderMessages() {
   if (!c.messages.length) {
     const mm = modelById(S.settings.model);
     const online = RT.server === 'ok', pending = RT.server === 'loading' || !RT.server;
-    const kicker = pending ? ['', 'Linking to local server'] : online ? ['', 'Link established'] : RT.server === 'demo' ? ['', 'Demo mode · simulated replies'] : ['off', RT.server === 'nokey' ? 'API key missing' : RT.server === 'down' ? 'Server offline' : 'Groq error'];
+    const kicker = pending ? ['', 'Linking to local server'] : online ? ['', 'Link established'] : RT.server === 'demo' ? (RT.why === 'nokey' ? ['off', 'Claude Code not signed in · demo replies'] : ['', 'Demo mode · simulated replies']) : ['off', RT.server === 'nokey' ? 'Claude Code not signed in' : RT.server === 'down' ? 'Server offline' : 'Claude Code error'];
     box.innerHTML = `<div class="empty">
       <div class="hero">
         <div class="hero-kicker ${kicker[0]}"><i></i>Neural console <span>//</span> ${kicker[1]}</div>
@@ -3393,7 +3393,7 @@ const Activity = (() => {
     gEl.val.textContent = shown == null ? '—' : fmtN(shown);
     gEl.lab.textContent = run.on ? 'tok/s · live' : avg ? 'tok/s · avg' : 'tok/s';
     gEl.box.setAttribute('aria-label', shown == null ? 'Token speed: no reply yet' : `Token speed: ${fmtN(shown)} tokens per second, ${run.on ? 'live estimate' : avg ? 'average of the last reply' : 'idle'}${peak > 1 ? `, peak ${fmtN(peak)}` : ''}`);
-    gEl.box.title = run.on ? 'Live estimate from the streamed text (about 4 characters per token)' : avg ? 'Average speed of the last reply, from Groq\'s token counts' : 'Token speed';
+    gEl.box.title = run.on ? 'Live estimate from the streamed text (about 4 characters per token)' : avg ? 'Average speed of the last reply, from Claude Code\'s token counts' : 'Token speed';
   }
   function refresh() {
     const t = now(), M = MODES[mode], P = progress(mode, t);
@@ -4092,7 +4092,7 @@ const Activity = (() => {
     bay.classList.add('is-on'); document.body.classList.add('ai-on');
     clearInterval(textTimer); textTimer = setInterval(refresh, 250);   // readouts stay current even if animation frames are paused
     const s = S.settings;
-    setMode(s.web ? 'search' : s.code ? 'code' : s.functions ? 'tools' : 'core');
+    setMode(s.web ? 'search' : toolOn('code') ? 'code' : toolOn('functions') ? 'tools' : 'core');
   }
   function observe(c) {
     if (!run.on || !c) return;
@@ -4135,7 +4135,7 @@ const Activity = (() => {
     refresh(); kick();
   }
   function syncChips() {
-    const s = S.settings, f = { web: !!s.web, code: !!s.code, functions: !!s.functions };
+    const s = S.settings, f = { web: !!s.web, code: toolOn('code'), functions: toolOn('functions') };
     if (!flags) { flags = f; order = ['functions', 'code', 'web'].filter(k => f[k]).map(k => KEYMODE[k]); chatMode = chipMode(); if (where === 'chat') setMode(chatMode, true); return; }
     const changed = Object.keys(f).filter(k => f[k] !== flags[k]);
     changed.forEach(k => { order = order.filter(x => x !== KEYMODE[k]); if (f[k]) order.push(KEYMODE[k]); });
@@ -4313,7 +4313,7 @@ $('#tplMenu').addEventListener('click', e => {
 });
 
 /* =========================================================
-   Generation (real replies from Groq)
+   Generation (real replies from Claude Code)
    ========================================================= */
 function estimateInput(conv, uptoIdx) {
   let t = tok(conv.system) + 30;
@@ -4358,9 +4358,8 @@ async function runAssistant(conv, target) {
     if (s.web) results = await webSearch(c, m, history, userMsg, sig);
     const tools = buildTools(c, m, conv, model);
     const notes = [];
-    if ((s.code || s.functions) && !model.tools) notes.push(`${model.name} can’t use tools, so it answered without code or functions.`);
     if ((userMsg.files || []).some(f => f.kind === 'image') && !(model.vision && s.vision)) notes.push(model.vision ? 'Image understanding is off, so only the image’s file name was sent.' : `${model.name} can’t read images, so only the image’s file name was sent.`);
-    if (DEMO.on) notes.push('Demo mode: this reply was simulated in your browser, not generated by Groq.');
+    if (DEMO.on) notes.push('Demo mode: this reply was simulated in your browser, not generated by Claude.');
     c.note = notes.join(' ');
     const extra = [];
     if (tools.some(t => t.name === 'run_javascript')) extra.push('You can run JavaScript with the run_javascript tool. Use it for calculations and data analysis instead of working numbers out in your head, then explain what the results show. Attached text files are available to the code.');
@@ -4369,9 +4368,9 @@ async function runAssistant(conv, target) {
     if (results.length) appendToLastUser(messages, '\n\n<search_results>\n' + sourcesBlock(results) + '\n</search_results>');
     const params = requestParams(model);
     if (s.json && !tools.length) params.response_format = { type: 'json_object' };
-    c.phase = 'wait'; setLive('Waiting for Groq…'); paint(m);
+    c.phase = 'wait'; setLive('Waiting for Claude…'); paint(m);
     sent = true;
-    const r = await runChat({ model, messages, tools, params, signal: sig, usage, onWait: w => setLive(`Groq rate limit, retrying in ${Math.ceil(w)}s…`), onUpdate: u => {
+    const r = await runChat({ model, messages, tools, params, signal: sig, usage, onWait: w => setLive(`Rate limited, retrying in ${Math.ceil(w)}s…`), onUpdate: u => {
       if (!ttft && (u.content || u.reasoning)) ttft = performance.now() - t0;
       if (u.reasoning && !u.content && c.phase !== 'reasoning') { c.phase = 'reasoning'; rStart = rStart || performance.now(); setLive('Thinking…'); }
       if (u.content && c.phase !== 'answer') { c.phase = 'answer'; if (rStart && !c.rMs) c.rMs = performance.now() - rStart; setLive('Writing…');  }
@@ -4425,7 +4424,7 @@ function renderParams() {
     return `<div class="param"><div class="param-top"><label for="p-${p.k}">${p.label}</label><input class="num" type="number" id="pn-${p.k}" min="${p.min}" max="${p.max}" step="${p.step}" value="${v}" aria-label="${p.label} value"></div>
       <input type="range" id="p-${p.k}" min="${p.min}" max="${p.max}" step="${p.step}" value="${v}" style="--pct:${pct}%" aria-describedby="pd-${p.k}">
       <div class="param-desc${w ? ' warn' : ''}" id="pd-${p.k}">${esc(w || descOf(p, v))}</div></div>`;
-  }).join('') + `<div class="msg-note">${I.info}<span>These go straight to Groq. On reasoning models, thinking tokens count toward max output tokens.</span></div>`;
+  }).join('') + `<div class="msg-note">${I.info}<span>Claude Code sets temperature and sampling itself, so only the output length is adjustable here. Thinking counts toward it.</span></div>`;
   PARAMS.forEach(p => {
     const r = $('#p-' + p.k), n = $('#pn-' + p.k), d = $('#pd-' + p.k);
     const set = (val, from) => {
@@ -4442,12 +4441,10 @@ function renderParams() {
 }
 function renderPanel() {
   const s = S.settings; const m = modelById(s.model);
-  const levels = ['auto', 'low', 'medium', 'high'];
-  $('#segReason').innerHTML = levels.map(l => `<button role="radio" aria-checked="${s.reasoning === l}" data-r="${l}" tabindex="${s.reasoning === l ? 0 : -1}">${cap1(l)}</button>`).join('');
-  $('#reasonHint').textContent = !m.thinks ? `${m.name} doesn’t take a reasoning effort, so this setting is ignored for it.`
-    : !m.effort ? `${m.name} picks its own reasoning effort on Groq, so this setting is ignored for it. Its thinking shows above each reply.`
-    : s.reasoning === 'auto' ? `${m.name} uses its default effort. Its thinking shows above each reply.`
-    : `Sets how hard ${m.name} thinks. Higher is slower and uses more tokens. Its thinking shows above each reply.`;
+  if (!EFFORT_LEVELS.includes(s.reasoning)) s.reasoning = 'auto';
+  $('#segReason').innerHTML = EFFORT_LEVELS.map(l => `<button role="radio" aria-checked="${s.reasoning === l}" data-r="${l}" tabindex="${s.reasoning === l ? 0 : -1}" title="${l === 'auto' ? 'Claude Code’s default effort' : cap1(l) + ' effort'}">${EFFORT_LABEL[l]}</button>`).join('');
+  $('#reasonHint').textContent = s.reasoning === 'auto' ? `${m.name} uses Claude Code’s default effort. Its thinking shows above each reply when Claude Code shares it.`
+    : `Sets how hard ${m.name} thinks. Higher is slower and uses more of your plan. Max is for the hardest problems.`;
   $('#swJson').setAttribute('aria-checked', String(s.json));
   $('#schemaBox').hidden = !s.json;
   if (document.activeElement !== $('#schemaText')) $('#schemaText').value = s.schema;
@@ -4455,9 +4452,9 @@ function renderPanel() {
   const toolsOk = m.tools, imgOk = m.vision;
   const tools = [
     ['web', 'Web search', 'Searches Bing through the local server and cites sources', I.globe, true],
-    ['code', 'Code interpreter', toolsOk ? 'The model writes JavaScript and runs it in a sandbox in your browser' : `${m.name} can’t use tools`, I.code, toolsOk],
+    ['code', 'Code interpreter', toolsOk ? 'The model writes JavaScript and runs it in a sandbox in your browser' : 'Not available through Claude Code here', I.code, toolsOk],
     ['vision', 'Image understanding', imgOk ? 'Send attached images to the model' : `${m.name} can’t read images`, I.image, imgOk],
-    ['functions', 'Custom functions', toolsOk ? 'The model can call your functions, which return your mock responses' : `${m.name} can’t use tools`, I.fn, toolsOk],
+    ['functions', 'Custom functions', toolsOk ? 'The model can call your functions, which return your mock responses' : 'Not available through Claude Code here', I.fn, toolsOk],
   ];
   $('#toolSwitches').innerHTML = tools.map(([k, label, desc, icon, ok]) => `<div class="sw-row"><div class="sw-text"><span id="lbl-${k}">${icon}${label}</span><small>${esc(desc)}</small></div><button class="switch" role="switch" data-tool="${k}" aria-labelledby="lbl-${k}" aria-checked="${!!s[k] && ok}" ${ok ? '' : 'disabled'}></button></div>`).join('');
   $('#fnList').hidden = !s.functions;
@@ -4467,12 +4464,13 @@ function renderPanel() {
   $('#chipWeb').setAttribute('aria-pressed', String(!!s.web));
   $('#chipCode').setAttribute('aria-pressed', String(!!s.code));
   $('#chipFn').setAttribute('aria-pressed', String(!!s.functions));
+  $('#chipCode').hidden = $('#chipFn').hidden = !m.tools;
   updateUsageViews();
   Activity.syncChips();
 }
 $('#segReason').addEventListener('click', e => { const b = e.target.closest('[data-r]'); if (!b) return; S.settings.reasoning = b.dataset.r; save(); renderPanel(); $(`#segReason [data-r="${b.dataset.r}"]`).focus(); });
 $('#segReason').addEventListener('keydown', e => {
-  const L = ['auto', 'low', 'medium', 'high']; let i = Math.max(0, L.indexOf(S.settings.reasoning));
+  const L = EFFORT_LEVELS; let i = Math.max(0, L.indexOf(S.settings.reasoning));
   if (e.key === 'ArrowRight' || e.key === 'ArrowDown') i = (i + 1) % 4; else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') i = (i + 3) % 4; else return;
   e.preventDefault(); S.settings.reasoning = L[i]; save(); renderPanel(); $(`#segReason [data-r="${L[i]}"]`).focus();
 });
@@ -4541,7 +4539,7 @@ function updateUsageViews() {
 }
 
 /* =========================================================
-   Compare (real replies from each Groq model)
+   Compare (real replies from each Claude model)
    ========================================================= */
 function renderCompare() {
   $('#cmpPrompt').value = ui.cmp ? ui.cmp.prompt : S.cmpPrompt;
@@ -4564,7 +4562,7 @@ function cmpColHTML(r) {
 }
 function renderCmpGrid() {
   const st = ui.cmp;
-  if (!st) { $('#cmpGrid').innerHTML = `<div class="card cmp-empty"><p>Pick the models, then run the prompt. Each reply streams from Groq with real timings and token counts.</p></div>`; $('#cmpSummary').innerHTML = ''; return; }
+  if (!st) { $('#cmpGrid').innerHTML = `<div class="card cmp-empty"><p>Pick the models, then run the prompt. Each reply streams from Claude Code with real timings and token counts.</p></div>`; $('#cmpSummary').innerHTML = ''; return; }
   $('#cmpGrid').innerHTML = st.runs.map(cmpColHTML).join('');
   enhance($('#cmpGrid'));
   const done = st.runs.filter(r => r.status === 'done');
